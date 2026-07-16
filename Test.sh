@@ -72,3 +72,66 @@ az functionapp deployment source config-zip \
 ```
 
 If this still fails with the identical error, don't burn more time on config tweaks — go straight to fix **#3** (upload the zip yourself via `az storage blob upload` + SAS URL + `WEBSITE_RUN_FROM_PACKAGE`). That one doesn't depend on Kudu's storage check working at all, so it's the most likely to actually get you deployed today regardless of what's broken underneath. Want the exact commands for that queued up now in case `WEBSITE_DNS_SERVER` doesn't do it?
+This confirms it — this is a well-documented, known pattern (H2 in this guide) and matches exactly what we hypothesized. Key line from the source:
+
+> Assigning a managed identity to the function app does NOT change deployment storage authentication. By default, deployment storage uses connection string auth. If `allowSharedKeyAccess: false`, publish fails unless you explicitly switch deployment storage to identity-based auth.
+
+That's your exact symptom. Two things to check/do, in order:
+
+**1. Confirm this is actually the cause — check current deployment storage auth type:**
+
+```bash
+az functionapp deployment config show \
+  --name az-func-hodsai-dev-cae-002 \
+  --resource-group az-rg-hodsai-dev-cae-001 \
+  --query "deploymentStorage" \
+  --output json
+```
+
+If `authentication.type` shows `storageaccountconnectionstring`, that confirms H2 exactly — the deployment engine is trying to use a connection string against a storage account that's locked down to key-based access, hence a resolution/access failure that manifests as "Name or service not known" (the DNS error is likely a downstream symptom of the auth handshake never getting far enough to even matter — worth noting for the writeup).
+
+**2. Apply the fix — same command you found, using System-Assigned identity since that's what you already have wired up:**
+
+```bash
+az functionapp deployment config set \
+  --name az-func-hodsai-dev-cae-002 \
+  --resource-group az-rg-hodsai-dev-cae-001 \
+  --deployment-storage-name azsthodsaidevcae004 \
+  --deployment-storage-container-name deploymentpackages \
+  --deployment-storage-auth-type SystemAssignedIdentity
+```
+
+**3. Re-check to confirm it took (learn from the earlier `vnetRouteAllEnabled` lag):**
+
+```bash
+az functionapp deployment config show \
+  --name az-func-hodsai-dev-cae-002 \
+  --resource-group az-rg-hodsai-dev-cae-001 \
+  --query "deploymentStorage.authentication.type" \
+  --output tsv
+```
+
+Should return `systemassignedidentity`.
+
+**4. Then retry deployment:**
+
+```bash
+az functionapp deployment source config-zip \
+  --resource-group az-rg-hodsai-dev-cae-001 \
+  --name az-func-hodsai-dev-cae-002 \
+  --src HODS-Deployment.zip
+```
+
+One more thing this guide flags that's worth checking regardless of outcome — the storage account's `allowSharedKeyAccess` and `defaultAction`:
+
+```bash
+az storage account show \
+  --name azsthodsaidevcae004 \
+  --resource-group az-rg-hodsai-dev-cae-001 \
+  --query "{allowSharedKeyAccess:allowSharedKeyAccess, defaultAction:networkRuleSet.defaultAction}" \
+  --output json
+```
+
+If `allowSharedKeyAccess: false`, that's the smoking gun tying it all together — connection-string auth was structurally impossible against this account the whole time, no matter what DNS/VNet settings you fixed.
+
+Run step 1 first and share the output — that alone will tell us if this is the answer before you even touch the fix.Cr
